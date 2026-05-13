@@ -1,0 +1,101 @@
+name: validate-patches
+
+# Rebase this branch onto upstream/develop on a schedule and run the
+# python_uv unit + integration tests. Fails loud (opens an issue) if the
+# rebase conflicts or any test breaks — so we get an early signal when an
+# upstream change makes one of our carried patches obsolete or wrong.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: validate-patches
+  cancel-in-progress: false
+
+jobs:
+  rebase-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout patched-stack
+        uses: actions/checkout@v4
+        with:
+          ref: patched-stack
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: configure git
+        run: |
+          git config user.name "patch-bot"
+          git config user.email "patch-bot@users.noreply.github.com"
+
+      - name: fetch upstream develop
+        run: |
+          git remote add upstream https://github.com/aws/aws-lambda-builders.git
+          git fetch upstream develop
+
+      - name: rebase onto upstream/develop
+        id: rebase
+        run: |
+          if ! git rebase upstream/develop; then
+            git rebase --abort
+            echo "rebase_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest mock parameterized
+
+      - name: run python_uv unit tests
+        run: pytest -vv tests/unit/workflows/python_uv
+
+      - name: run python_uv integration tests
+        run: pytest -vv tests/integration/workflows/python_uv
+
+      - name: push rebased patched-stack
+        run: git push --force-with-lease origin patched-stack
+
+      - name: file issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "patched-stack failed to rebase or test against upstream/develop";
+            const body = [
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ``,
+              `Stack carries:`,
+              `- fix(python-uv): cached build copies dependencies to the build dir  (PR #870 upstream)`,
+              `- fix(python-uv): pass --no-default-groups to uv export  (PR #869 upstream)`,
+              ``,
+              `Once either PR merges, drop the matching commit from patched-stack.`,
+            ].join("\n");
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "patch-validation",
+            });
+            if (existing.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ["patch-validation"],
+              });
+            }
